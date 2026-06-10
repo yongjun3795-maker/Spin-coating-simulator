@@ -15,20 +15,34 @@ function solveEBP({ omega_rpm, eta0_mPas, h0_um, E_nm_s, n, rho, dt, t_max }) {
   let t = 0;
   let t_gel = null;
 
-  const A = 2 * rho * omega * omega / 3;             // centrifugal coeff
+  const A = 2 * rho * omega * omega / 3;             // = 2ρω²/3  [eq. 6 coefficient]
+
+  // FIX ①: gelation defined as exact crossover 2ρω²h³/(3η) = E (eq. 6 definition).
+  // We detect the first step where centrifugal term crosses below E (sign change).
+  let prev_excess = null;
 
   while (t <= t_max && h > h0 * 0.01) {
-    const eta = eta0 * Math.pow(h0 / h, n);
-    const dhdt = -(A * h * h * h / eta) - E;
+    const eta   = eta0 * Math.pow(h0 / h, n);        // Meyerhofer eq. (7)
+    const cent  = A * h * h * h / eta;               // 2ρω²h³/(3η)
+    const dhdt  = -cent - E;
 
-    // gelation: centrifugal term ≈ E
-    if (t_gel === null && Math.abs(A * h * h * h / eta) < Math.abs(E) * 1.05) {
-      t_gel = t;
+    // FIX ①: t_gel = first time cent crosses E from above (exact crossover)
+    const excess = cent - Math.abs(E);
+    if (t_gel === null && prev_excess !== null && prev_excess >= 0 && excess < 0) {
+      // linear interpolation for sub-step accuracy
+      t_gel = t - dt * excess / (excess - prev_excess);
     }
+    prev_excess = excess;
+
+    // FIX ②: analytical solution h_an = h0/sqrt(1 + 4ρω²h0²t/(3η0))  [eq. 10]
+    // Only meaningful when E=0 and n=0 (constant viscosity). Always compute for
+    // display; the h(t) chart will show it as a second line when E=0 and n≤0.1.
+    const h_an = h0 / Math.sqrt(1 + (4 * rho * omega * omega * h0 * h0 * t) / (3 * eta0));
 
     results.push({
-      t: parseFloat(t.toFixed(3)),
-      h_um: parseFloat((h * 1e6).toFixed(4)),
+      t:       parseFloat(t.toFixed(3)),
+      h_um:    parseFloat((h   * 1e6).toFixed(4)),
+      h_an_um: parseFloat((h_an * 1e6).toFixed(4)),   // analytical overlay
       eta_rel: parseFloat((eta / eta0).toFixed(2)),
     });
 
@@ -60,8 +74,8 @@ function solveRadial({ omega_rpm, eta0_mPas, h0_um, E_nm_s, n, rho, t_eval, Nr }
       const eta = eta0 * Math.pow(h0 / Math.max(h[i], h0 * 0.01), n);
       const A   = 2 * rho * omega * omega / 3;
       let conv  = 0;
-      if (i > 0 && i < Nr - 1) {
-        const dhdr = (h[i] - h[i - 1]) / dr;
+      if (i > 0) {
+        const dhdr = (h[i] - h[i - 1]) / dr;          // upwind (centrifugal wave outward)
         conv = (rho * omega * omega * r * h[i] * h[i] / eta) * dhdr;
       }
       const dhdt = -(A * h[i] * h[i] * h[i] / eta) - E - conv;
@@ -82,9 +96,7 @@ function Slider({ label, unit, value, min, max, step, onChange, info }) {
   return (
     <div style={{ marginBottom: 18 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-        <span style={{ fontSize: 13, color: "#ccc", fontFamily: "monospace" }}>
-          {label}
-        </span>
+        <span style={{ fontSize: 13, color: "#ccc", fontFamily: "monospace" }}>{label}</span>
         <span style={{ fontSize: 13, fontWeight: 600, color: "#7dd3fc", fontFamily: "monospace" }}>
           {value} {unit}
         </span>
@@ -109,11 +121,11 @@ export default function App() {
     n:         3.5,
     rho:       1100,
   });
-  const [data, setData]         = useState({ results: [], t_gel: null, h_final: null });
-  const [radial, setRadial]     = useState([]);
-  const [t_eval, setTeval]      = useState(10);
-  const [tab, setTab]           = useState("ht");   // "ht" | "radial" | "eta"
-  const [running, setRunning]   = useState(false);
+  const [data, setData]       = useState({ results: [], t_gel: null, h_final: null });
+  const [radial, setRadial]   = useState([]);
+  const [t_eval, setTeval]    = useState(10);
+  const [tab, setTab]         = useState("ht");
+  const [running, setRunning] = useState(false);
 
   const run = useCallback(() => {
     setRunning(true);
@@ -130,90 +142,64 @@ export default function App() {
 
   const set = (key) => (val) => setParams(p => ({ ...p, [key]: val }));
 
-  // uniformity from radial profile
+  // FIX ③: uniformity = (h_max − h_min) / (2 · h_avg) × 100  [standard definition]
   const uniformity = (() => {
     if (radial.length < 2) return null;
-    const vals = radial.map(d => d.h_um);
-    const hc   = vals[0];
-    const he   = vals[vals.length - 1];
-    const pct  = Math.abs((he - hc) / hc * 100);
+    const vals   = radial.map(d => d.h_um);
+    const h_max  = Math.max(...vals);
+    const h_min  = Math.min(...vals);
+    const h_avg  = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const pct    = (h_max - h_min) / (2 * h_avg) * 100;
+    const hc     = vals[0];
+    const he     = vals[vals.length - 1];
     return { hc: hc.toFixed(3), he: he.toFixed(3), pct: pct.toFixed(2) };
   })();
 
+  // FIX ②: show analytical overlay only when E=0 and n≤0.1 (constant-viscosity limit)
+  const showAnalytical = params.E_nm_s === 0 && params.n <= 0.1;
+
   const styles = {
     app: {
-      minHeight: "100vh",
-      background: "#0a0f1e",
-      color: "#e2e8f0",
-      fontFamily: "'Inter', 'Segoe UI', sans-serif",
-      padding: "0 0 60px",
+      minHeight: "100vh", background: "#0a0f1e", color: "#e2e8f0",
+      fontFamily: "'Inter', 'Segoe UI', sans-serif", padding: "0 0 60px",
     },
     header: {
       background: "linear-gradient(135deg, #0f172a 0%, #1e293b 100%)",
-      borderBottom: "1px solid #1e3a5f",
-      padding: "28px 40px 24px",
+      borderBottom: "1px solid #1e3a5f", padding: "28px 40px 24px",
     },
-    title: {
-      fontSize: 22, fontWeight: 700, color: "#f1f5f9", margin: 0,
-      letterSpacing: "-0.5px",
-    },
-    subtitle: { fontSize: 13, color: "#64748b", marginTop: 4 },
+    title:     { fontSize: 22, fontWeight: 700, color: "#f1f5f9", margin: 0, letterSpacing: "-0.5px" },
+    subtitle:  { fontSize: 13, color: "#64748b", marginTop: 4 },
     body: {
-      display: "grid",
-      gridTemplateColumns: "280px 1fr",
-      gap: 24,
-      maxWidth: 1200,
-      margin: "28px auto 0",
-      padding: "0 24px",
+      display: "grid", gridTemplateColumns: "280px 1fr", gap: 24,
+      maxWidth: 1200, margin: "28px auto 0", padding: "0 24px",
     },
-    panel: {
-      background: "#0f172a",
-      border: "1px solid #1e293b",
-      borderRadius: 12,
-      padding: "20px 18px",
-    },
-    panelTitle: {
-      fontSize: 11, fontWeight: 600, color: "#475569",
-      textTransform: "uppercase", letterSpacing: "0.1em",
-      marginBottom: 20,
-    },
-    right: { display: "flex", flexDirection: "column", gap: 16 },
-    metrics: {
-      display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12,
-    },
-    metric: {
-      background: "#0f172a", border: "1px solid #1e293b",
-      borderRadius: 10, padding: "14px 16px",
-    },
+    panel:     { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "20px 18px" },
+    panelTitle: { fontSize: 11, fontWeight: 600, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 20 },
+    right:     { display: "flex", flexDirection: "column", gap: 16 },
+    metrics:   { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 },
+    metric:    { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: "14px 16px" },
     metricLabel: { fontSize: 11, color: "#475569", marginBottom: 4 },
     metricValue: { fontSize: 20, fontWeight: 700, color: "#7dd3fc", fontFamily: "monospace" },
-    metricUnit: { fontSize: 11, color: "#475569", marginLeft: 4 },
-    chartBox: {
-      background: "#0f172a", border: "1px solid #1e293b",
-      borderRadius: 12, padding: "20px 16px",
-    },
-    tabs: { display: "flex", gap: 8, marginBottom: 16 },
+    metricUnit:  { fontSize: 11, color: "#475569", marginLeft: 4 },
+    chartBox:  { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "20px 16px" },
+    tabs:      { display: "flex", gap: 8, marginBottom: 16 },
     tab: (active) => ({
       padding: "6px 16px", borderRadius: 6, fontSize: 12, fontWeight: 500,
       cursor: "pointer", border: "none",
       background: active ? "#0ea5e9" : "#1e293b",
-      color: active ? "#fff" : "#64748b",
-      transition: "all 0.15s",
+      color: active ? "#fff" : "#64748b", transition: "all 0.15s",
     }),
     warn: (ok) => ({
-      display: "inline-block",
-      fontSize: 11, padding: "3px 10px", borderRadius: 999,
-      background: ok ? "#14532d" : "#7f1d1d",
-      color: ok ? "#86efac" : "#fca5a5",
-      marginLeft: 8,
+      display: "inline-block", fontSize: 11, padding: "3px 10px", borderRadius: 999,
+      background: ok ? "#14532d" : "#7f1d1d", color: ok ? "#86efac" : "#fca5a5", marginLeft: 8,
     }),
   };
 
-  const h_final   = data.h_final?.toFixed(3) ?? "—";
-  const t_gel_s   = data.t_gel != null ? data.t_gel.toFixed(1) : "—";
-  const Re        = (params.rho * (params.omega_rpm * 2 * Math.PI / 60) *
-                    (params.h0_um * 1e-6) ** 2 / (params.eta0_mPas * 1e-3)).toExponential(1);
-  const Re_ok     = parseFloat(Re) < 0.01;
+  const h_final = data.h_final?.toFixed(3) ?? "—";
+  const t_gel_s = data.t_gel != null ? data.t_gel.toFixed(1) : "—";
+  const Re      = (params.rho * (params.omega_rpm * 2 * Math.PI / 60) *
+                  (params.h0_um * 1e-6) ** 2 / (params.eta0_mPas * 1e-3)).toExponential(1);
+  const Re_ok   = parseFloat(Re) < 0.01;
 
   return (
     <div style={styles.app}>
@@ -224,34 +210,34 @@ export default function App() {
             Emslie-Bonner-Peck | Forward Euler FDM
           </span>
         </div>
-        <div style={styles.subtitle}>
-          SKKU Chemical Engineering · Fluid Mechanics Term Project 2026
-        </div>
+        <div style={styles.subtitle}>SKKU Chemical Engineering · Fluid Mechanics Term Project 2026</div>
       </div>
 
       <div style={styles.body}>
-        {/* ── Left panel: parameters ── */}
+        {/* ── Left panel ── */}
         <div style={styles.panel}>
           <div style={styles.panelTitle}>Parameters</div>
-          <Slider label="ω (spin speed)"   unit="rpm"   value={params.omega_rpm} min={500}  max={8000} step={100}  onChange={set("omega_rpm")} info="Higher ω → thinner film" />
-          <Slider label="η₀ (viscosity)"   unit="mPa·s" value={params.eta0_mPas} min={1}    max={100}  step={0.5}  onChange={set("eta0_mPas")} info="Initial viscosity of PR solution" />
-          <Slider label="h₀ (init thick)"  unit="μm"    value={params.h0_um}     min={1}    max={50}   step={0.5}  onChange={set("h0_um")}    info="Initial film thickness" />
-          <Slider label="E (evaporation)"  unit="nm/s"  value={params.E_nm_s}    min={0}    max={200}  step={1}    onChange={set("E_nm_s")}   info="Solvent evaporation rate" />
-          <Slider label="n (viscosity exp)" unit=""      value={params.n}          min={1}    max={6}    step={0.1}  onChange={set("n")}        info="Meyerhofer power-law exponent" />
-          <Slider label="ρ (density)"      unit="kg/m³" value={params.rho}        min={800}  max={1400} step={10}   onChange={set("rho")}      />
+          <Slider label="ω (spin speed)"    unit="rpm"   value={params.omega_rpm} min={500}  max={8000} step={100} onChange={set("omega_rpm")} info="Higher ω → thinner film" />
+          <Slider label="η₀ (viscosity)"    unit="mPa·s" value={params.eta0_mPas} min={1}    max={100}  step={0.5} onChange={set("eta0_mPas")} info="Initial viscosity of PR solution" />
+          <Slider label="h₀ (init thick)"   unit="μm"    value={params.h0_um}     min={1}    max={50}   step={0.5} onChange={set("h0_um")}    info="Initial film thickness" />
+          <Slider label="E (evaporation)"   unit="nm/s"  value={params.E_nm_s}    min={0}    max={200}  step={1}   onChange={set("E_nm_s")}   info="Solvent evaporation rate" />
+          <Slider label="n (viscosity exp)" unit=""       value={params.n}          min={0}    max={6}    step={0.1} onChange={set("n")}        info="0 = const η (analytical overlay shown)" />
+          <Slider label="ρ (density)"       unit="kg/m³" value={params.rho}        min={800}  max={1400} step={10}  onChange={set("rho")} />
 
           <div style={{ borderTop: "1px solid #1e293b", paddingTop: 14, marginTop: 4 }}>
             <div style={styles.panelTitle}>Radial profile at t =</div>
             <Slider label="t_eval" unit="s" value={t_eval} min={1} max={60} step={1} onChange={setTeval} />
           </div>
 
-          <div style={{
-            background: "#020817", borderRadius: 8, padding: "10px 12px",
-            fontSize: 12, fontFamily: "monospace", color: "#64748b", lineHeight: 1.7,
-          }}>
+          <div style={{ background: "#020817", borderRadius: 8, padding: "10px 12px", fontSize: 12, fontFamily: "monospace", color: "#64748b", lineHeight: 1.7 }}>
             <div>Re = <span style={{ color: Re_ok ? "#86efac" : "#fca5a5" }}>{Re}</span>
               <span style={styles.warn(Re_ok)}>{Re_ok ? "lubrication ✓" : "Re not ≪ 1 !"}</span>
             </div>
+            {showAnalytical && (
+              <div style={{ color: "#fbbf24", marginTop: 4 }}>
+                ▲ Analytical overlay active (E=0, n=0)
+              </div>
+            )}
           </div>
         </div>
 
@@ -267,7 +253,8 @@ export default function App() {
               <div><span style={styles.metricValue}>{t_gel_s}</span><span style={styles.metricUnit}>s</span></div>
             </div>
             <div style={styles.metric}>
-              <div style={styles.metricLabel}>Uniformity (edge/center)</div>
+              {/* FIX ③: label updated to match standard uniformity definition */}
+              <div style={styles.metricLabel}>Uniformity (h_max−h_min)/(2h_avg)</div>
               <div>
                 <span style={{ ...styles.metricValue, color: uniformity && parseFloat(uniformity.pct) < 2 ? "#86efac" : "#fca5a5" }}>
                   {uniformity ? uniformity.pct : "—"}
@@ -276,7 +263,7 @@ export default function App() {
               </div>
             </div>
             <div style={styles.metric}>
-              <div style={styles.metricLabel}>Re</div>
+              <div style={styles.metricLabel}>Re = ρωh₀²/η₀</div>
               <div><span style={{ ...styles.metricValue, fontSize: 16, color: Re_ok ? "#86efac" : "#fca5a5" }}>{Re}</span></div>
             </div>
           </div>
@@ -294,10 +281,17 @@ export default function App() {
                   <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                   <XAxis dataKey="t" label={{ value: "time (s)", position: "insideBottom", offset: -12, fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
                   <YAxis label={{ value: "h (μm)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }} labelFormatter={v => `t = ${v} s`} formatter={v => [`${v} μm`, "h"]} />
-                  <Line type="monotone" dataKey="h_um" stroke="#38bdf8" dot={false} strokeWidth={2} name="h (μm)" />
+                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }} labelFormatter={v => `t = ${v} s`} />
+                  <Legend wrapperStyle={{ fontSize: 12, color: "#64748b" }} />
+                  {/* FDM solution always shown */}
+                  <Line type="monotone" dataKey="h_um"    stroke="#38bdf8" dot={false} strokeWidth={2} name="FDM (eq. 6)" />
+                  {/* FIX ②: analytical overlay only when E=0, n=0 */}
+                  {showAnalytical && (
+                    <Line type="monotone" dataKey="h_an_um" stroke="#fbbf24" dot={false} strokeWidth={1.5} strokeDasharray="5 3" name="Analytical eq.(10)" />
+                  )}
                   {data.t_gel != null && (
-                    <Line type="monotone" data={[{ t: data.t_gel, h_um: 0 }, { t: data.t_gel, h_um: params.h0_um }]}
+                    <Line type="monotone"
+                      data={[{ t: data.t_gel, h_um: 0 }, { t: data.t_gel, h_um: params.h0_um }]}
                       dataKey="h_um" stroke="#f97316" dot={false} strokeDasharray="4 4" strokeWidth={1.5} name="t_gel" />
                   )}
                 </LineChart>
@@ -310,9 +304,10 @@ export default function App() {
                   Radial thickness profile at t = {t_eval} s
                   {uniformity && (
                     <span style={{ marginLeft: 12, color: "#94a3b8" }}>
-                      center: {uniformity.hc} μm · edge: {uniformity.he} μm · deviation: {uniformity.pct}%
+                      center: {uniformity.hc} μm · edge: {uniformity.he} μm
+                      · uniformity: {uniformity.pct}%
                       <span style={styles.warn(parseFloat(uniformity.pct) < 2)}>
-                        {parseFloat(uniformity.pct) < 2 ? "±2% spec ✓" : "spec fail ✗"}
+                        {parseFloat(uniformity.pct) < 2 ? "< 2% ✓" : "> 2% ✗"}
                       </span>
                     </span>
                   )}
@@ -343,17 +338,15 @@ export default function App() {
           </div>
 
           {/* equation reference */}
-          <div style={{
-            background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12,
-            padding: "16px 20px", fontSize: 12, color: "#475569", lineHeight: 1.8,
-            fontFamily: "monospace",
-          }}>
+          <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 20px", fontSize: 12, color: "#475569", lineHeight: 1.8, fontFamily: "monospace" }}>
             <span style={{ color: "#64748b", fontWeight: 600 }}>EBP ODE: </span>
             <span style={{ color: "#94a3b8" }}>dh/dt = −2ρω²h³/(3η(t)) − E</span>
             <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>Meyerhofer: </span>
             <span style={{ color: "#94a3b8" }}>η(t) = η₀·(h₀/h)ⁿ</span>
-            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>Scheme: </span>
-            <span style={{ color: "#94a3b8" }}>Forward Euler, Δt = 0.1 ms</span>
+            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>Uniformity: </span>
+            <span style={{ color: "#94a3b8" }}>(h_max−h_min)/(2·h_avg)</span>
+            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>t_gel: </span>
+            <span style={{ color: "#94a3b8" }}>2ρω²h³/(3η) = E crossover</span>
           </div>
         </div>
       </div>
