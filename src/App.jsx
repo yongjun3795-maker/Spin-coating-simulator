@@ -1,298 +1,259 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  ResponsiveContainer, ReferenceLine,
 } from "recharts";
+import { solveEBP, solveRadial, spinCurve, reducedRe } from "./physics";
 
-// ── EBP numerical solver ──────────────────────────────────────────────────────
-function solveEBP({ omega_rpm, eta0_mPas, h0_um, E_nm_s, n, rho, dt, t_max }) {
-  const omega = omega_rpm * 2 * Math.PI / 60;       // rad/s
-  const eta0  = eta0_mPas * 1e-3;                    // Pa·s
-  const h0    = h0_um    * 1e-6;                     // m
-  const E     = E_nm_s   * 1e-9;                     // m/s
+const C = {
+  bg: "#0a0f1e", panel: "#0f172a", line: "#1e293b", deep: "#020817",
+  text: "#e2e8f0", dim: "#64748b", faint: "#475569",
+  cyan: "#38bdf8", cyanSoft: "#7dd3fc", amber: "#fbbf24",
+  violet: "#a78bfa", green: "#34d399", orange: "#f97316",
+  ok: "#86efac", bad: "#fca5a5", okBg: "#14532d", badBg: "#7f1d1d",
+};
 
-  const results = [];
-  let h = h0;
-  let t = 0;
-  let t_gel = null;
+const TABS = [
+  ["spin", "스핀 커브 — h vs ω"],
+  ["ht", "h(t) — 두께"],
+  ["radial", "h(r) — 평탄화"],
+  ["eta", "η(t) — 점도"],
+];
 
-  const A = 2 * rho * omega * omega / 3;             // = 2ρω²/3  [eq. 6 coefficient]
-
-  // FIX ①: gelation defined as exact crossover 2ρω²h³/(3η) = E (eq. 6 definition).
-  // We detect the first step where centrifugal term crosses below E (sign change).
-  let prev_excess = null;
-
-  while (t <= t_max && h > h0 * 0.01) {
-    const eta   = eta0 * Math.pow(h0 / h, n);        // Meyerhofer eq. (7)
-    const cent  = A * h * h * h / eta;               // 2ρω²h³/(3η)
-    const dhdt  = -cent - E;
-
-    // FIX ①: t_gel = first time cent crosses E from above (exact crossover)
-    const excess = cent - Math.abs(E);
-    if (t_gel === null && prev_excess !== null && prev_excess >= 0 && excess < 0) {
-      // linear interpolation for sub-step accuracy
-      t_gel = t - dt * excess / (excess - prev_excess);
-    }
-    prev_excess = excess;
-
-    // FIX ②: analytical solution h_an = h0/sqrt(1 + 4ρω²h0²t/(3η0))  [eq. 10]
-    // Only meaningful when E=0 and n=0 (constant viscosity). Always compute for
-    // display; the h(t) chart will show it as a second line when E=0 and n≤0.1.
-    const h_an = h0 / Math.sqrt(1 + (4 * rho * omega * omega * h0 * h0 * t) / (3 * eta0));
-
-    results.push({
-      t:       parseFloat(t.toFixed(3)),
-      h_um:    parseFloat((h   * 1e6).toFixed(4)),
-      h_an_um: parseFloat((h_an * 1e6).toFixed(4)),   // analytical overlay
-      eta_rel: parseFloat((eta / eta0).toFixed(2)),
-    });
-
-    h += dhdt * dt;
-    if (h < 0) h = 0;
-    t += dt;
-  }
-
-  return { results, t_gel, h_final: h * 1e6 };
-}
-
-// ── Radial profile solver ─────────────────────────────────────────────────────
-function solveRadial({ omega_rpm, eta0_mPas, h0_um, E_nm_s, n, rho, t_eval, Nr }) {
-  const omega = omega_rpm * 2 * Math.PI / 60;
-  const eta0  = eta0_mPas * 1e-3;
-  const h0    = h0_um    * 1e-6;
-  const E     = E_nm_s   * 1e-9;
-  const R     = 0.1;                                  // wafer radius 10 cm
-  const dr    = R / (Nr - 1);
-  const dt    = 1e-4;
-
-  let h = new Array(Nr).fill(h0);
-  let t = 0;
-
-  while (t < t_eval) {
-    const h_new = [...h];
-    for (let i = 0; i < Nr; i++) {
-      const r   = i * dr;
-      const eta = eta0 * Math.pow(h0 / Math.max(h[i], h0 * 0.01), n);
-      const A   = 2 * rho * omega * omega / 3;
-      let conv  = 0;
-      if (i > 0) {
-        const dhdr = (h[i] - h[i - 1]) / dr;          // upwind (centrifugal wave outward)
-        conv = (rho * omega * omega * r * h[i] * h[i] / eta) * dhdr;
-      }
-      const dhdt = -(A * h[i] * h[i] * h[i] / eta) - E - conv;
-      h_new[i] = Math.max(h[i] + dhdt * dt, 0);
-    }
-    h = h_new;
-    t += dt;
-  }
-
-  return h.map((hi, i) => ({
-    r_mm: parseFloat((i * dr * 1000).toFixed(1)),
-    h_um: parseFloat((hi * 1e6).toFixed(4)),
-  }));
-}
-
-// ── Slider component ──────────────────────────────────────────────────────────
 function Slider({ label, unit, value, min, max, step, onChange, info }) {
   return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-        <span style={{ fontSize: 13, color: "#ccc", fontFamily: "monospace" }}>{label}</span>
-        <span style={{ fontSize: 13, fontWeight: 600, color: "#7dd3fc", fontFamily: "monospace" }}>
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+        <span style={{ fontSize: 12.5, color: "#cbd5e1", fontFamily: "monospace" }}>{label}</span>
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: C.cyanSoft, fontFamily: "monospace" }}>
           {value} {unit}
         </span>
       </div>
       <input
         type="range" min={min} max={max} step={step} value={value}
-        onChange={e => onChange(parseFloat(e.target.value))}
-        style={{ width: "100%", accentColor: "#38bdf8", cursor: "pointer" }}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{ width: "100%", accentColor: C.cyan, cursor: "pointer" }}
       />
-      {info && <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{info}</div>}
+      {info && <div style={{ fontSize: 10.5, color: C.faint, marginTop: 2 }}>{info}</div>}
     </div>
   );
 }
 
-// ── Main App ──────────────────────────────────────────────────────────────────
+function Metric({ label, value, unit, tone }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "13px 15px" }}>
+      <div style={{ fontSize: 10.5, color: C.faint, marginBottom: 4, lineHeight: 1.3 }}>{label}</div>
+      <div>
+        <span style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: tone || C.cyanSoft }}>
+          {value}
+        </span>
+        {unit && <span style={{ fontSize: 11, color: C.faint, marginLeft: 4 }}>{unit}</span>}
+      </div>
+    </div>
+  );
+}
+
+const axis = { tick: { fill: C.dim, fontSize: 11 }, stroke: C.line };
+const tip = {
+  contentStyle: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, fontSize: 12 },
+  labelStyle: { color: C.dim },
+};
+
 export default function App() {
-  const [params, setParams] = useState({
-    omega_rpm: 3000,
-    eta0_mPas: 10,
-    h0_um:     10,
-    E_nm_s:    50,
-    n:         3.5,
-    rho:       1100,
+  const [p, setP] = useState({
+    omega_rpm: 3000, eta0_mPas: 10, h0_um: 10, E_nm_s: 50, n: 3.5, rho: 1100,
   });
-  const [data, setData]       = useState({ results: [], t_gel: null, h_final: null });
-  const [radial, setRadial]   = useState([]);
-  const [t_eval, setTeval]    = useState(10);
-  const [tab, setTab]         = useState("ht");
-  const [running, setRunning] = useState(false);
+  const [tEval, setTEval] = useState(10);
+  const [bump, setBump] = useState(35);
+  const [tab, setTab] = useState("spin");
+  const [busy, setBusy] = useState(false);
 
-  const run = useCallback(() => {
-    setRunning(true);
-    setTimeout(() => {
-      const res = solveEBP({ ...params, dt: 1e-4, t_max: 120 });
-      setData(res);
-      const rad = solveRadial({ ...params, t_eval, Nr: 50 });
-      setRadial(rad);
-      setRunning(false);
-    }, 10);
-  }, [params, t_eval]);
+  // 슬라이더를 끄는 동안 매 프레임 다시 풀지 않는다 — 200 ms 쉰 뒤 한 번만
+  const [settled, setSettled] = useState(p);
+  const [settledUI, setSettledUI] = useState({ tEval, bump });
+  const timer = useRef();
+  useEffect(() => {
+    setBusy(true);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => {
+      setSettled(p);
+      setSettledUI({ tEval, bump });
+      setBusy(false);
+    }, 200);
+    return () => clearTimeout(timer.current);
+  }, [p, tEval, bump]);
 
-  useEffect(() => { run(); }, [run]);
+  const ebp = useMemo(() => solveEBP(settled), [settled]);
+  const radial = useMemo(
+    () => solveRadial(settled, { tEval: settledUI.tEval, bump: settledUI.bump / 100 }),
+    [settled, settledUI]
+  );
+  const spin = useMemo(() => spinCurve(settled), [settled]);
 
-  const set = (key) => (val) => setParams(p => ({ ...p, [key]: val }));
+  const set = (k) => (v) => setP((q) => ({ ...q, [k]: v }));
 
-  // FIX ③: uniformity = (h_max − h_min) / (2 · h_avg) × 100  [standard definition]
-  const uniformity = (() => {
-    if (radial.length < 2) return null;
-    const vals   = radial.map(d => d.h_um);
-    const h_max  = Math.max(...vals);
-    const h_min  = Math.min(...vals);
-    const h_avg  = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const pct    = (h_max - h_min) / (2 * h_avg) * 100;
-    const hc     = vals[0];
-    const he     = vals[vals.length - 1];
-    return { hc: hc.toFixed(3), he: he.toFixed(3), pct: pct.toFixed(2) };
-  })();
+  const Re = reducedRe(p);
+  const ReOk = Re < 0.01;
+  const showAnalytical = p.E_nm_s === 0 && p.n <= 0.1;
 
-  // FIX ②: show analytical overlay only when E=0 and n≤0.1 (constant-viscosity limit)
-  const showAnalytical = params.E_nm_s === 0 && params.n <= 0.1;
-
-  const styles = {
-    app: {
-      minHeight: "100vh", background: "#0a0f1e", color: "#e2e8f0",
-      fontFamily: "'Inter', 'Segoe UI', sans-serif", padding: "0 0 60px",
-    },
-    header: {
-      background: "linear-gradient(135deg, #0f172a 0%, #1e293b 100%)",
-      borderBottom: "1px solid #1e3a5f", padding: "28px 40px 24px",
-    },
-    title:     { fontSize: 22, fontWeight: 700, color: "#f1f5f9", margin: 0, letterSpacing: "-0.5px" },
-    subtitle:  { fontSize: 13, color: "#64748b", marginTop: 4 },
-    body: {
-      display: "grid", gridTemplateColumns: "280px 1fr", gap: 24,
-      maxWidth: 1200, margin: "28px auto 0", padding: "0 24px",
-    },
-    panel:     { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "20px 18px" },
-    panelTitle: { fontSize: 11, fontWeight: 600, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 20 },
-    right:     { display: "flex", flexDirection: "column", gap: 16 },
-    metrics:   { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 },
-    metric:    { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 10, padding: "14px 16px" },
-    metricLabel: { fontSize: 11, color: "#475569", marginBottom: 4 },
-    metricValue: { fontSize: 20, fontWeight: 700, color: "#7dd3fc", fontFamily: "monospace" },
-    metricUnit:  { fontSize: 11, color: "#475569", marginLeft: 4 },
-    chartBox:  { background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "20px 16px" },
-    tabs:      { display: "flex", gap: 8, marginBottom: 16 },
-    tab: (active) => ({
-      padding: "6px 16px", borderRadius: 6, fontSize: 12, fontWeight: 500,
-      cursor: "pointer", border: "none",
-      background: active ? "#0ea5e9" : "#1e293b",
-      color: active ? "#fff" : "#64748b", transition: "all 0.15s",
-    }),
-    warn: (ok) => ({
-      display: "inline-block", fontSize: 11, padding: "3px 10px", borderRadius: 999,
-      background: ok ? "#14532d" : "#7f1d1d", color: ok ? "#86efac" : "#fca5a5", marginLeft: 8,
-    }),
-  };
-
-  const h_final = data.h_final?.toFixed(3) ?? "—";
-  const t_gel_s = data.t_gel != null ? data.t_gel.toFixed(1) : "—";
-  const Re      = (params.rho * (params.omega_rpm * 2 * Math.PI / 60) *
-                  (params.h0_um * 1e-6) ** 2 / (params.eta0_mPas * 1e-3)).toExponential(1);
-  const Re_ok   = parseFloat(Re) < 0.01;
+  // 지수 판정 — 증발이 있으면 -1/2 근처가 기대값
+  const expo = spin.exponent;
+  const theory = spin.theory;
+  // 판정 기준은 "-1/2 인가" 가 아니라 "해석 예측과 맞는가" 다
+  const matches = expo != null && theory != null && Math.abs(expo - theory) < 0.01;
+  const expoTone = expo == null ? C.dim : matches ? C.ok : C.amber;
 
   return (
-    <div style={styles.app}>
-      <div style={styles.header}>
-        <div style={styles.title}>
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text,
+                  fontFamily: "'Inter','Segoe UI',sans-serif", paddingBottom: 60 }}>
+      <header style={{ background: "linear-gradient(135deg,#0f172a,#1e293b)",
+                       borderBottom: "1px solid #1e3a5f", padding: "26px 40px 22px" }}>
+        <div style={{ fontSize: 22, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.4px" }}>
           Spin Coating EBP Simulator
-          <span style={{ fontSize: 12, fontWeight: 400, color: "#475569", marginLeft: 12 }}>
-            Emslie-Bonner-Peck | Forward Euler FDM
+          <span style={{ fontSize: 12, fontWeight: 400, color: C.faint, marginLeft: 12 }}>
+            Emslie–Bonner–Peck · 적응 스텝 적분 · 보존형 유한체적
           </span>
         </div>
-        <div style={styles.subtitle}>SKKU Chemical Engineering · Fluid Mechanics Term Project 2026</div>
-      </div>
+        <div style={{ fontSize: 12.5, color: C.dim, marginTop: 4 }}>
+          포토레지스트 도포 공정 — 회전수와 용매 증발이 최종 막 두께를 어떻게 정하는가
+        </div>
+      </header>
 
-      <div style={styles.body}>
-        {/* ── Left panel ── */}
-        <div style={styles.panel}>
-          <div style={styles.panelTitle}>Parameters</div>
-          <Slider label="ω (spin speed)"    unit="rpm"   value={params.omega_rpm} min={500}  max={8000} step={100} onChange={set("omega_rpm")} info="Higher ω → thinner film" />
-          <Slider label="η₀ (viscosity)"    unit="mPa·s" value={params.eta0_mPas} min={1}    max={100}  step={0.5} onChange={set("eta0_mPas")} info="Initial viscosity of PR solution" />
-          <Slider label="h₀ (init thick)"   unit="μm"    value={params.h0_um}     min={1}    max={50}   step={0.5} onChange={set("h0_um")}    info="Initial film thickness" />
-          <Slider label="E (evaporation)"   unit="nm/s"  value={params.E_nm_s}    min={0}    max={200}  step={1}   onChange={set("E_nm_s")}   info="Solvent evaporation rate" />
-          <Slider label="n (viscosity exp)" unit=""       value={params.n}          min={0}    max={6}    step={0.1} onChange={set("n")}        info="0 = const η (analytical overlay shown)" />
-          <Slider label="ρ (density)"       unit="kg/m³" value={params.rho}        min={800}  max={1400} step={10}  onChange={set("rho")} />
+      <div style={{ display: "grid", gridTemplateColumns: "290px 1fr", gap: 22,
+                    maxWidth: 1220, margin: "26px auto 0", padding: "0 24px" }}>
+        {/* 좌측 — 파라미터 */}
+        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "18px 17px" }}>
+          <div style={{ fontSize: 10.5, fontWeight: 600, color: C.faint, textTransform: "uppercase",
+                        letterSpacing: ".1em", marginBottom: 16 }}>공정 조건</div>
 
-          <div style={{ borderTop: "1px solid #1e293b", paddingTop: 14, marginTop: 4 }}>
-            <div style={styles.panelTitle}>Radial profile at t =</div>
-            <Slider label="t_eval" unit="s" value={t_eval} min={1} max={60} step={1} onChange={setTeval} />
+          <Slider label="ω 회전수" unit="rpm" value={p.omega_rpm} min={500} max={8000} step={100}
+                  onChange={set("omega_rpm")} info="빠를수록 얇아진다" />
+          <Slider label="η₀ 초기 점도" unit="mPa·s" value={p.eta0_mPas} min={1} max={100} step={0.5}
+                  onChange={set("eta0_mPas")} info="PR 용액의 점도" />
+          <Slider label="h₀ 초기 두께" unit="µm" value={p.h0_um} min={1} max={50} step={0.5}
+                  onChange={set("h0_um")} info="디스펜스 직후" />
+          <Slider label="E 증발 속도" unit="nm/s" value={p.E_nm_s} min={0} max={200} step={1}
+                  onChange={set("E_nm_s")} info="0 이면 겔화가 없다" />
+          <Slider label="n 점도 지수" unit="" value={p.n} min={0} max={6} step={0.1}
+                  onChange={set("n")} info="η = η₀(h₀/h)ⁿ · 0 이면 상수 점도" />
+          <Slider label="ρ 밀도" unit="kg/m³" value={p.rho} min={800} max={1400} step={10}
+                  onChange={set("rho")} />
+
+          <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 13, marginTop: 6 }}>
+            <div style={{ fontSize: 10.5, fontWeight: 600, color: C.faint, textTransform: "uppercase",
+                          letterSpacing: ".1em", marginBottom: 12 }}>평탄화 탭 설정</div>
+            <Slider label="t 평가 시각" unit="s" value={tEval} min={1} max={40} step={1} onChange={setTEval} />
+            <Slider label="초기 중앙 과잉" unit="%" value={bump} min={0} max={80} step={5} onChange={setBump}
+                    info="0 이면 균일 — 균일이 유지되는지가 솔버 검증" />
           </div>
 
-          <div style={{ background: "#020817", borderRadius: 8, padding: "10px 12px", fontSize: 12, fontFamily: "monospace", color: "#64748b", lineHeight: 1.7 }}>
-            <div>Re = <span style={{ color: Re_ok ? "#86efac" : "#fca5a5" }}>{Re}</span>
-              <span style={styles.warn(Re_ok)}>{Re_ok ? "lubrication ✓" : "Re not ≪ 1 !"}</span>
+          <div style={{ background: C.deep, borderRadius: 8, padding: "10px 12px", fontSize: 11.5,
+                        fontFamily: "monospace", color: C.dim, lineHeight: 1.7 }}>
+            <div>
+              Re = <span style={{ color: ReOk ? C.ok : C.bad }}>{Re.toExponential(1)}</span>
+              <span style={{ display: "inline-block", fontSize: 10, padding: "2px 8px", borderRadius: 999,
+                             marginLeft: 8, background: ReOk ? C.okBg : C.badBg, color: ReOk ? C.ok : C.bad }}>
+                {ReOk ? "윤활 근사 ✓" : "Re ≪ 1 아님"}
+              </span>
             </div>
-            {showAnalytical && (
-              <div style={{ color: "#fbbf24", marginTop: 4 }}>
-                ▲ Analytical overlay active (E=0, n=0)
-              </div>
-            )}
+            {showAnalytical && <div style={{ color: C.amber, marginTop: 4 }}>▲ 해석해 비교 활성 (E=0, n=0)</div>}
+            {ebp.hitCap && <div style={{ color: C.bad, marginTop: 4 }}>▲ 스텝 상한 도달 — 결과 신뢰 주의</div>}
+            {busy && <div style={{ color: C.faint, marginTop: 4 }}>계산 중…</div>}
           </div>
         </div>
 
-        {/* ── Right: metrics + charts ── */}
-        <div style={styles.right}>
-          <div style={styles.metrics}>
-            <div style={styles.metric}>
-              <div style={styles.metricLabel}>Final thickness</div>
-              <div><span style={styles.metricValue}>{h_final}</span><span style={styles.metricUnit}>μm</span></div>
-            </div>
-            <div style={styles.metric}>
-              <div style={styles.metricLabel}>Gelation time</div>
-              <div><span style={styles.metricValue}>{t_gel_s}</span><span style={styles.metricUnit}>s</span></div>
-            </div>
-            <div style={styles.metric}>
-              {/* FIX ③: label updated to match standard uniformity definition */}
-              <div style={styles.metricLabel}>Uniformity (h_max−h_min)/(2h_avg)</div>
-              <div>
-                <span style={{ ...styles.metricValue, color: uniformity && parseFloat(uniformity.pct) < 2 ? "#86efac" : "#fca5a5" }}>
-                  {uniformity ? uniformity.pct : "—"}
-                </span>
-                <span style={styles.metricUnit}>%</span>
-              </div>
-            </div>
-            <div style={styles.metric}>
-              <div style={styles.metricLabel}>Re = ρωh₀²/η₀</div>
-              <div><span style={{ ...styles.metricValue, fontSize: 16, color: Re_ok ? "#86efac" : "#fca5a5" }}>{Re}</span></div>
-            </div>
+        {/* 우측 */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 15 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 11 }}>
+            <Metric label="최종 두께" value={ebp.hFinal_um.toFixed(3)} unit="µm" />
+            <Metric label="겔화 시각" value={ebp.tGel != null ? ebp.tGel.toFixed(1) : "—"} unit="s" />
+            <Metric label={theory != null ? `스핀 지수 p — 이론 ${theory.toFixed(3)}` : "스핀 지수 p (h ∝ ωᵖ)"}
+                    value={expo != null ? expo.toFixed(3) : "—"} tone={expoTone} />
+            <Metric label={`평탄화 후 불균일도 (t=${settledUI.tEval}s)`}
+                    value={radial.nonUniformity_pct.toFixed(2)} unit="%"
+                    tone={radial.nonUniformity_pct < 2 ? C.ok : C.bad} />
           </div>
 
-          <div style={styles.chartBox}>
-            <div style={styles.tabs}>
-              {[["ht","h(t) — thickness vs time"],["radial","h(r) — radial profile"],["eta","η(t) — viscosity"]].map(([k, label]) => (
-                <button key={k} style={styles.tab(tab === k)} onClick={() => setTab(k)}>{label}</button>
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "18px 16px" }}>
+            <div style={{ display: "flex", gap: 7, marginBottom: 14, flexWrap: "wrap" }}>
+              {TABS.map(([k, label]) => (
+                <button key={k} onClick={() => setTab(k)}
+                  style={{ padding: "6px 14px", borderRadius: 6, fontSize: 12, fontWeight: 500,
+                           cursor: "pointer", border: "none", transition: "all .15s",
+                           background: tab === k ? "#0ea5e9" : C.line,
+                           color: tab === k ? "#fff" : C.dim }}>
+                  {label}
+                </button>
               ))}
             </div>
 
+            {tab === "spin" && (
+              <>
+                <div style={{ fontSize: 12, color: C.dim, marginBottom: 10, lineHeight: 1.6 }}>
+                  회전수를 500 → 8000 rpm 로 훑어 <b style={{ color: C.text }}>겔화 시점의 두께</b>를 뽑고
+                  로그-로그 회귀했다.
+                  {expo != null && (
+                    <>
+                      {" "}기울기 <b style={{ color: expoTone }}>p = {expo.toFixed(3)}</b>
+                      <span style={{ color: C.faint }}> (R² = {spin.r2.toFixed(4)})</span>.
+                    </>
+                  )}
+                  {theory != null ? (
+                    <div style={{ marginTop: 6 }}>
+                      겔화 조건 2ρω²h<sup>(3+n)</sup>/(3η₀h₀ⁿ) = E 를 풀면{" "}
+                      <b style={{ color: C.text }}>h ∝ ω<sup>−2/(3+n)</sup></b>,
+                      지금 n = {p.n} 이므로 이론값은{" "}
+                      <b style={{ color: C.cyanSoft }}>{theory.toFixed(3)}</b> 이다.
+                      {matches
+                        ? " 수치해가 여기에 붙는다 — 적분기 검증이 된다."
+                        : " 아직 벌어져 있다 — 적분 구간이나 스텝을 의심할 것."}
+                      <span style={{ color: C.amber }}>
+                        {" "}n = 1 로 두면 정확히 −1/2 가 되어 실험 경험식과 만난다.
+                      </span>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 6, color: C.amber }}>
+                      증발이 0 이라 겔화가 없다 — 막이 계속 얇아지므로 두께가 고정되지 않는다.
+                      E 를 올려야 스핀 커브가 공정에서 쓰는 의미를 갖는다.
+                    </div>
+                  )}
+                </div>
+                <ResponsiveContainer width="100%" height={310}>
+                  <LineChart data={spin.points} margin={{ top: 8, right: 20, bottom: 22, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.line} />
+                    <XAxis dataKey="rpm" scale="log" domain={["auto", "auto"]} type="number" {...axis}
+                           label={{ value: "ω (rpm, 로그)", position: "insideBottom", offset: -12, fill: C.dim, fontSize: 12 }} />
+                    <YAxis scale="log" domain={["auto", "auto"]} {...axis}
+                           tickFormatter={(v) => Number(v).toPrecision(2)}
+                           label={{ value: "최종 h (µm, 로그)", angle: -90, position: "insideLeft", fill: C.dim, fontSize: 12 }} />
+                    <Tooltip {...tip} formatter={(v, k) => [`${v} µm`, k === "h_um" ? "시뮬레이션" : "멱함수 적합"]}
+                             labelFormatter={(v) => `${v} rpm`} />
+                    <Legend wrapperStyle={{ fontSize: 12, color: C.dim }} />
+                    <Line type="monotone" dataKey="h_um" stroke={C.cyan} strokeWidth={2} dot={{ r: 2.5 }} name="시뮬레이션" />
+                    <Line type="monotone" dataKey="fit_um" stroke={C.amber} strokeWidth={1.5}
+                          strokeDasharray="5 3" dot={false} name={`적합 h ∝ ω^${expo != null ? expo.toFixed(2) : "?"}`} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </>
+            )}
+
             {tab === "ht" && (
               <ResponsiveContainer width="100%" height={320}>
-                <LineChart data={data.results} margin={{ top: 8, right: 20, bottom: 20, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                  <XAxis dataKey="t" label={{ value: "time (s)", position: "insideBottom", offset: -12, fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <YAxis label={{ value: "h (μm)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }} labelFormatter={v => `t = ${v} s`} />
-                  <Legend wrapperStyle={{ fontSize: 12, color: "#64748b" }} />
-                  {/* FDM solution always shown */}
-                  <Line type="monotone" dataKey="h_um"    stroke="#38bdf8" dot={false} strokeWidth={2} name="FDM (eq. 6)" />
-                  {/* FIX ②: analytical overlay only when E=0, n=0 */}
+                <LineChart data={ebp.curve} margin={{ top: 8, right: 20, bottom: 22, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={C.line} />
+                  <XAxis dataKey="t" type="number" domain={[0, "dataMax"]} {...axis}
+                         label={{ value: "시간 (s)", position: "insideBottom", offset: -12, fill: C.dim, fontSize: 12 }} />
+                  <YAxis {...axis} label={{ value: "h (µm)", angle: -90, position: "insideLeft", fill: C.dim, fontSize: 12 }} />
+                  <Tooltip {...tip} labelFormatter={(v) => `t = ${v} s`} />
+                  <Legend wrapperStyle={{ fontSize: 12, color: C.dim }} />
+                  <Line type="monotone" dataKey="h_um" stroke={C.cyan} dot={false} strokeWidth={2} name="수치해" />
                   {showAnalytical && (
-                    <Line type="monotone" dataKey="h_an_um" stroke="#fbbf24" dot={false} strokeWidth={1.5} strokeDasharray="5 3" name="Analytical eq.(10)" />
+                    <Line type="monotone" dataKey="h_an_um" stroke={C.amber} dot={false} strokeWidth={1.5}
+                          strokeDasharray="5 3" name="해석해" connectNulls />
                   )}
-                  {data.t_gel != null && (
-                    <Line type="monotone"
-                      data={[{ t: data.t_gel, h_um: 0 }, { t: data.t_gel, h_um: params.h0_um }]}
-                      dataKey="h_um" stroke="#f97316" dot={false} strokeDasharray="4 4" strokeWidth={1.5} name="t_gel" />
+                  {ebp.tGel != null && (
+                    <ReferenceLine x={+ebp.tGel.toFixed(3)} stroke={C.orange} strokeDasharray="4 4"
+                                   label={{ value: "겔화", fill: C.orange, fontSize: 11, position: "top" }} />
                   )}
                 </LineChart>
               </ResponsiveContainer>
@@ -300,25 +261,29 @@ export default function App() {
 
             {tab === "radial" && (
               <>
-                <div style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>
-                  Radial thickness profile at t = {t_eval} s
-                  {uniformity && (
-                    <span style={{ marginLeft: 12, color: "#94a3b8" }}>
-                      center: {uniformity.hc} μm · edge: {uniformity.he} μm
-                      · uniformity: {uniformity.pct}%
-                      <span style={styles.warn(parseFloat(uniformity.pct) < 2)}>
-                        {parseFloat(uniformity.pct) < 2 ? "< 2% ✓" : "> 2% ✗"}
-                      </span>
+                <div style={{ fontSize: 12, color: C.dim, marginBottom: 10, lineHeight: 1.6 }}>
+                  t = {settledUI.tEval} s · 중앙 {radial.center_um.toFixed(3)} µm · 가장자리 {radial.edge_um.toFixed(3)} µm
+                  {settledUI.bump === 0 ? (
+                    <span style={{ marginLeft: 10, color: C.amber }}>
+                      균일 초기조건 — EBP 는 균일막이 균일하게 유지된다고 예측한다.
+                      여기 남는 값은 물리가 아니라 <b>수치 오차</b>다.
+                    </span>
+                  ) : (
+                    <span style={{ marginLeft: 10 }}>
+                      중앙을 {settledUI.bump}% 두껍게 떨어뜨린 상태에서 시작 — 두꺼운 곳이 h³ 로 더 빨리 빠져
+                      <b style={{ color: C.text }}> 스스로 평탄해진다.</b>
                     </span>
                   )}
                 </div>
                 <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={radial} margin={{ top: 8, right: 20, bottom: 20, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                    <XAxis dataKey="r_mm" label={{ value: "r (mm)", position: "insideBottom", offset: -12, fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                    <YAxis label={{ value: "h (μm)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                    <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }} formatter={v => [`${v} μm`, "h"]} />
-                    <Line type="monotone" dataKey="h_um" stroke="#a78bfa" dot={false} strokeWidth={2} />
+                  <LineChart data={radial.profile} margin={{ top: 8, right: 20, bottom: 22, left: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.line} />
+                    <XAxis dataKey="r_mm" {...axis}
+                           label={{ value: "r (mm) — 웨이퍼 중심에서", position: "insideBottom", offset: -12, fill: C.dim, fontSize: 12 }} />
+                    <YAxis {...axis} domain={["auto", "auto"]}
+                           label={{ value: "h (µm)", angle: -90, position: "insideLeft", fill: C.dim, fontSize: 12 }} />
+                    <Tooltip {...tip} formatter={(v) => [`${v} µm`, "h"]} labelFormatter={(v) => `r = ${v} mm`} />
+                    <Line type="monotone" dataKey="h_um" stroke={C.violet} dot={false} strokeWidth={2} />
                   </LineChart>
                 </ResponsiveContainer>
               </>
@@ -326,27 +291,37 @@ export default function App() {
 
             {tab === "eta" && (
               <ResponsiveContainer width="100%" height={320}>
-                <LineChart data={data.results} margin={{ top: 8, right: 20, bottom: 20, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                  <XAxis dataKey="t" label={{ value: "time (s)", position: "insideBottom", offset: -12, fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <YAxis label={{ value: "η/η₀", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 12 }} tick={{ fill: "#64748b", fontSize: 11 }} />
-                  <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }} labelFormatter={v => `t = ${v} s`} formatter={v => [`${v}×`, "η/η₀"]} />
-                  <Line type="monotone" dataKey="eta_rel" stroke="#34d399" dot={false} strokeWidth={2} name="η/η₀" />
+                <LineChart data={ebp.curve} margin={{ top: 8, right: 20, bottom: 22, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={C.line} />
+                  <XAxis dataKey="t" type="number" domain={[0, "dataMax"]} {...axis}
+                         label={{ value: "시간 (s)", position: "insideBottom", offset: -12, fill: C.dim, fontSize: 12 }} />
+                  <YAxis {...axis} label={{ value: "η/η₀", angle: -90, position: "insideLeft", fill: C.dim, fontSize: 12 }} />
+                  <Tooltip {...tip} labelFormatter={(v) => `t = ${v} s`} formatter={(v) => [`${v}×`, "η/η₀"]} />
+                  <Line type="monotone" dataKey="eta_rel" stroke={C.green} dot={false} strokeWidth={2} name="η/η₀" />
                 </LineChart>
               </ResponsiveContainer>
             )}
           </div>
 
-          {/* equation reference */}
-          <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 12, padding: "16px 20px", fontSize: 12, color: "#475569", lineHeight: 1.8, fontFamily: "monospace" }}>
-            <span style={{ color: "#64748b", fontWeight: 600 }}>EBP ODE: </span>
-            <span style={{ color: "#94a3b8" }}>dh/dt = −2ρω²h³/(3η(t)) − E</span>
-            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>Meyerhofer: </span>
-            <span style={{ color: "#94a3b8" }}>η(t) = η₀·(h₀/h)ⁿ</span>
-            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>Uniformity: </span>
-            <span style={{ color: "#94a3b8" }}>(h_max−h_min)/(2·h_avg)</span>
-            <span style={{ marginLeft: 24, color: "#64748b", fontWeight: 600 }}>t_gel: </span>
-            <span style={{ color: "#94a3b8" }}>2ρω²h³/(3η) = E crossover</span>
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12,
+                        padding: "15px 19px", fontSize: 11.5, color: C.faint, lineHeight: 1.9,
+                        fontFamily: "monospace" }}>
+            <div>
+              <span style={{ color: C.dim, fontWeight: 600 }}>EBP </span>
+              <span style={{ color: "#94a3b8" }}>∂h/∂t = −(1/r)·∂(r·q)/∂r − E,  q = ρω²r·h³/(3η)</span>
+            </div>
+            <div>
+              <span style={{ color: C.dim, fontWeight: 600 }}>균일막 </span>
+              <span style={{ color: "#94a3b8" }}>dh/dt = −2ρω²h³/(3η) − E</span>
+              <span style={{ marginLeft: 20, color: C.dim, fontWeight: 600 }}>Meyerhofer </span>
+              <span style={{ color: "#94a3b8" }}>η(h) = η₀·(h₀/h)ⁿ</span>
+            </div>
+            <div>
+              <span style={{ color: C.dim, fontWeight: 600 }}>겔화 </span>
+              <span style={{ color: "#94a3b8" }}>2ρω²h³/(3η) = E 가 되는 시각</span>
+              <span style={{ marginLeft: 20, color: C.dim, fontWeight: 600 }}>불균일도 </span>
+              <span style={{ color: "#94a3b8" }}>(h_max−h_min)/(2·h_avg)</span>
+            </div>
           </div>
         </div>
       </div>
